@@ -1,0 +1,183 @@
+name: Flutter Build APK
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch'
+        required: true
+      build_mode:
+        default: 'release'
+      app_name:
+        default: 'my_flutter_app'
+      display_name:
+        default: ''
+      target_platform:
+        default: 'android-arm64'
+      clean_build:
+        default: 'true'
+      admob_id:
+        default: ''
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch }}
+          fetch-depth: 1
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            /opt/hostedtoolcache/flutter
+          key: flutter-gradle-${{ runner.os }}-stable
+          restore-keys: flutter-gradle-${{ runner.os }}-
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+      - name: Build APK
+        run: |
+          APP="${{ github.event.inputs.app_name }}"
+          MODE="${{ github.event.inputs.build_mode }}"
+          DISPLAY_NAME="${{ github.event.inputs.display_name }}"
+          TARGET="${{ github.event.inputs.target_platform }}"
+          DO_CLEAN="${{ github.event.inputs.clean_build }}"
+          ADMOB_ID="${{ github.event.inputs.admob_id }}"
+          if [ -z "${DISPLAY_NAME}" ]; then DISPLAY_NAME="${APP}"; fi
+          if [ -z "${TARGET}" ]; then TARGET="android-arm64"; fi
+
+          # ── Create flutter app scaffold ───────────────────────────────────
+          flutter create --org com.example --project-name ${APP} /tmp/build_app
+          cp -r lib/. /tmp/build_app/lib/
+          if [ -d "assets" ]; then mkdir -p /tmp/build_app/assets && cp -r assets/. /tmp/build_app/assets/; fi
+          if [ -d "fonts" ]; then mkdir -p /tmp/build_app/fonts && cp -r fonts/. /tmp/build_app/fonts/; fi
+          cp pubspec.yaml /tmp/build_app/pubspec.yaml
+          [ -f "pubspec.lock" ] && cp pubspec.lock /tmp/build_app/pubspec.lock
+          sed -i "s/^name: .*/name: ${APP}/" /tmp/build_app/pubspec.yaml
+
+          # ── Copy android files ────────────────────────────────────────────
+          for ANDROID_FILE in android/app/build.gradle android/build.gradle android/gradle.properties android/build.gradle.kts android/app/build.gradle.kts android/settings.gradle android/settings.gradle.kts android/app/google-services.json google-services.json android/app/src/main/res/values/strings.xml android/app/src/main/res/values/styles.xml android/app/src/main/res/values/colors.xml android/app/src/main/res/xml/network_security_config.xml; do
+            if [ -f "${ANDROID_FILE}" ]; then
+              mkdir -p "/tmp/build_app/$(dirname ${ANDROID_FILE})"
+              cp "${ANDROID_FILE}" "/tmp/build_app/${ANDROID_FILE}"
+            fi
+          done
+          find android -name "MainActivity.kt" -o -name "MainActivity.java" -o -name "MainFlutterActivity.kt" 2>/dev/null | while read f; do
+            [ -f "$f" ] && mkdir -p "/tmp/build_app/$(dirname $f)" && cp "$f" "/tmp/build_app/$f"
+          done
+          if [ -d "android/app/src/main/res" ]; then
+            find android/app/src/main/res -name "*.xml" -o -name "*.png" -o -name "*.webp" 2>/dev/null | while read f; do
+              mkdir -p "/tmp/build_app/$(dirname $f)" && cp "$f" "/tmp/build_app/$f"
+            done
+          fi
+
+          # ── Remove conflicting Groovy .gradle when .kts exists ────────────
+          for KTS in android/app/build.gradle.kts android/settings.gradle.kts android/build.gradle.kts; do
+            GROOVY="${KTS%.kts}"
+            if [ -f "/tmp/build_app/${KTS}" ] && [ -f "/tmp/build_app/${GROOVY}" ]; then
+              rm "/tmp/build_app/${GROOVY}"
+              echo "Removed conflicting ${GROOVY}"
+            fi
+          done
+
+          # ── Manifest: meta-data + label + strings + AdMob ────────────────
+          SRC="android/app/src/main/AndroidManifest.xml"
+          DST="/tmp/build_app/android/app/src/main/AndroidManifest.xml"
+          if [ -f "$SRC" ]; then
+            META=$(grep -o '<meta-data[^/]*/>' "$SRC" 2>/dev/null || true)
+            if [ -n "$META" ]; then
+              printf '%s
+' "$META" | while IFS= read -r mtag; do
+                sed -i "s|</application>|        ${mtag}
+    </application>|" "$DST"
+              done
+              echo "$(echo "$META" | wc -l) meta-data merged"
+            fi
+          fi
+          sed -i 's|android:label="[^"]*"|android:label="@string/app_name"|g' "$DST"
+          STRINGS_XML="/tmp/build_app/android/app/src/main/res/values/strings.xml"
+          mkdir -p "$(dirname ${STRINGS_XML})"
+          echo '<resources><string name="app_name">'"${DISPLAY_NAME}"'</string></resources>' > "${STRINGS_XML}"
+          if [ -n "$ADMOB_ID" ]; then
+            if grep -q "com.google.android.gms.ads.APPLICATION_ID" "$DST" 2>/dev/null; then
+              sed -i "s|android:name=\"com.google.android.gms.ads.APPLICATION_ID\"[^>]*android:value=\"[^\"]*\"|android:name=\"com.google.android.gms.ads.APPLICATION_ID\" android:value=\"$ADMOB_ID\"|g" "$DST"
+            else
+              sed -i "/<\/application>/i\\        <meta-data android:name=\"com.google.android.gms.ads.APPLICATION_ID\" android:value=\"$ADMOB_ID\"/>" "$DST"
+            fi
+            echo "AdMob ID injected: $ADMOB_ID"
+          fi
+
+          # ── cd into build dir, pub get ────────────────────────────────────
+          cd /tmp/build_app
+          if [ "${DO_CLEAN}" != "false" ]; then flutter clean; fi
+          flutter pub get
+
+          # ── Inject dependencyResolutionManagement (fixes Unresolved refs) ─
+          for SGF in android/settings.gradle android/settings.gradle.kts; do
+            [ -f "$SGF" ] || continue
+            grep -q "dependencyResolutionManagement" "$SGF" && continue
+            # Insert before include( if present, else append
+            if grep -q "^include(" "$SGF"; then
+              sed -i "/^include(/i \
+\
+dependencyResolutionManagement {\
+    repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)\
+    repositories {\
+        google()\
+        mavenCentral()\
+    }\
+}" "$SGF"
+            else
+              printf '\ndependencyResolutionManagement {\n    repositoriesMode.set(RepositoriesMode.PREFER_SETTINGS)\n    repositories {\n        google()\n        mavenCentral()\n    }\n}\n' >> "$SGF"
+            fi
+            echo "Injected dependencyResolutionManagement into $SGF"
+          done
+
+          # ── AGP / Kotlin version patch ────────────────────────────────────
+          for f in android/settings.gradle android/settings.gradle.kts android/build.gradle android/build.gradle.kts; do
+            [ -f "$f" ] || continue
+            sed -i 's|com\.android\.tools\.build:gradle:[0-9][0-9.]*|com.android.tools.build:gradle:8.10.0|g' "$f"
+            sed -i 's|id("com\.android\.application") version "[0-9][0-9.]*"|id("com.android.application") version "8.10.0"|g' "$f"
+            sed -i 's|id("com\.android\.library") version "[0-9][0-9.]*"|id("com.android.library") version "8.10.0"|g' "$f"
+            sed -i 's|id("org\.jetbrains\.kotlin\.android") version "[0-9][0-9.]*"|id("org.jetbrains.kotlin.android") version "2.1.0"|g' "$f"
+            sed -i 's|org\.jetbrains\.kotlin:kotlin-gradle-plugin:[0-9][0-9.]*|org.jetbrains.kotlin:kotlin-gradle-plugin:2.1.0|g' "$f"
+            sed -i "s|kotlin_version = '[0-9][0-9.]*'|kotlin_version = '2.1.0'|g" "$f"
+            sed -i 's|kotlin_version = "[0-9][0-9.]*"|kotlin_version = "2.1.0"|g' "$f"
+          done
+
+          # ── Gradle wrapper ────────────────────────────────────────────────
+          WRAPPER="android/gradle/wrapper/gradle-wrapper.properties"
+          [ -f "$WRAPPER" ] && sed -i 's|distributionUrl=.*|distributionUrl=https\\://services.gradle.org/distributions/gradle-8.11.1-all.zip|g' "$WRAPPER"
+
+          # ── compileSdk patch ──────────────────────────────────────────────
+          find android -name 'build.gradle' | while read f; do
+            sed -i 's/compileSdkVersion flutter.compileSdkVersion/compileSdkVersion 36/g' "$f"
+            sed -i 's/compileSdk = flutter.compileSdkVersion/compileSdk = 36/g' "$f"
+            sed -i 's/compileSdkVersion [0-9][0-9]*/compileSdkVersion 36/g' "$f"
+            sed -i 's/compileSdk = [0-9][0-9]*/compileSdk = 36/g' "$f"
+          done
+          find android -name 'build.gradle.kts' | while read f; do
+            sed -i 's/compileSdk = flutter.compileSdkVersion/compileSdk = 36/g' "$f"
+            sed -i 's/compileSdk = [0-9][0-9]*/compileSdk = 36/g' "$f"
+          done
+
+          # ── Build ─────────────────────────────────────────────────────────
+          if [ "$MODE" = "release" ]; then
+            if [ "${TARGET}" = "all" ]; then flutter build apk --release --split-debug-info=/tmp/dbg
+            else flutter build apk --release --target-platform ${TARGET} --split-debug-info=/tmp/dbg; fi
+          elif [ "$MODE" = "profile" ]; then
+            if [ "${TARGET}" = "all" ]; then flutter build apk --profile
+            else flutter build apk --profile --target-platform ${TARGET}; fi
+          else
+            if [ "${TARGET}" = "all" ]; then flutter build apk --debug --no-shrink --no-tree-shake-icons
+            else flutter build apk --debug --no-shrink --no-tree-shake-icons --target-platform ${TARGET}; fi
+          fi
+          mkdir -p $GITHUB_WORKSPACE/build/app/outputs/flutter-apk/
+          cp build/app/outputs/flutter-apk/*.apk $GITHUB_WORKSPACE/build/app/outputs/flutter-apk/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: build/app/outputs/flutter-apk/*.apk
+          retention-days: 7
